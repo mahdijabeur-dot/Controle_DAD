@@ -1105,7 +1105,7 @@ h1, h2, h3, h4, h5, h6 { font-weight: 700; line-height: 1.2; letter-spacing: -0.
         <button class="btn btn-outline btn-sm" onclick="exportExcelSynthese()" title="Synthèse Excel : points de contrôle × dossiers, sur une seule feuille">Excel</button>
         <button class="btn btn-outline btn-sm" onclick="exportJSON()">JSON</button>
         <button class="btn btn-outline btn-sm" onclick="exportPDF()">PDF</button>
-        <input type="file" id="importFileInput" accept=".csv,.json" onchange="handleImportFile(event)" style="display:none;">
+        <input type="file" id="importFileInput" accept=".csv,.json,.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" onchange="handleImportFile(event)" style="display:none;">
       </div>
     </div>
   </div>
@@ -3317,6 +3317,17 @@ function parseCSVFull(text) {
 function handleImportFile(e) {
   const f = e.target.files[0]; if (!f) return;
   const ext = f.name.split('.').pop().toLowerCase();
+  if (['xlsx', 'xls'].includes(ext)) {
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try { importExcel(ev.target.result, f.name); }
+      catch (err) { console.error(err); showToast(`Erreur de lecture Excel : ${err.message || err}`, 'error'); }
+    };
+    reader.onerror = () => showToast('Impossible de lire le fichier Excel', 'error');
+    reader.readAsArrayBuffer(f);
+    e.target.value = '';
+    return;
+  }
   const reader = new FileReader();
   reader.onload = ev => {
     try {
@@ -3331,6 +3342,96 @@ function handleImportFile(e) {
   reader.onerror = () => showToast('Impossible de lire le fichier', 'error');
   reader.readAsText(f, 'UTF-8');
   e.target.value = '';
+}
+
+function excelText(value) {
+  return value === undefined || value === null ? '' : String(value).trim();
+}
+
+function excelDate(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  const text = excelText(value);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const match = text.match(/(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/);
+  return match ? `${match[1]}-${String(match[2]).padStart(2, '0')}-${String(match[3]).padStart(2, '0')}` : '';
+}
+
+function excelHeaderIndex(headers, names) {
+  const wanted = names.map(name => name.toLowerCase());
+  return headers.findIndex(header => wanted.includes(excelText(header).toLowerCase()));
+}
+
+function importExcel(arrayBuffer, fileName) {
+  if (typeof XLSX === 'undefined') {
+    throw new Error('La bibliothèque Excel n’est pas disponible. Ouvrez le fichier avec une connexion internet.');
+  }
+  const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: true, cellText: false });
+  const detailSheetName = workbook.SheetNames.find(name => /d[eé]tail.*contr[oô]le/i.test(name)) || workbook.SheetNames[1];
+  const summarySheetName = workbook.SheetNames.find(name => /synth[eè]se.*dossier/i.test(name)) || workbook.SheetNames[0];
+  const detailRows = detailSheetName ? XLSX.utils.sheet_to_json(workbook.Sheets[detailSheetName], { header: 1, defval: '' }) : [];
+  const summaryRows = summarySheetName ? XLSX.utils.sheet_to_json(workbook.Sheets[summarySheetName], { header: 1, defval: '' }) : [];
+  if (detailRows.length < 2) throw new Error('Aucune feuille « Détail Contrôles » exploitable n’a été trouvée.');
+
+  const detailHeaders = detailRows[0].map(excelText);
+  const iRefFiche = excelHeaderIndex(detailHeaders, ['Réf. Fiche', 'Ref. Fiche']);
+  const iDossier = excelHeaderIndex(detailHeaders, ['Réf. Dossier', 'Ref. Dossier']);
+  const iDate = excelHeaderIndex(detailHeaders, ['Date']);
+  const iEntite = excelHeaderIndex(detailHeaders, ['Entité', 'Entite', 'Entité/Agence', 'Entite/Agence']);
+  const iPoint = excelHeaderIndex(detailHeaders, ['Point de Contrôle', 'Point de Controle']);
+  const iStatus = excelHeaderIndex(detailHeaders, ['Évaluation', 'Evaluation', 'Statut']);
+  const iObs = excelHeaderIndex(detailHeaders, ['Observations', 'Observation']);
+  if ([iDossier, iPoint, iStatus].some(index => index < 0)) {
+    throw new Error('Colonnes obligatoires absentes : Réf. Dossier, Point de Contrôle ou Évaluation.');
+  }
+
+  const imported = new Map();
+  let importedControls = 0;
+  detailRows.slice(1).forEach(row => {
+    const dossierRef = excelText(row[iDossier]);
+    if (!dossierRef) return;
+    if (!imported.has(dossierRef)) {
+      const dossier = new Dossier(dossierRef, excelText(row[iEntite]));
+      dossier.id = `D${imported.size + 1}`;
+      imported.set(dossierRef, dossier);
+    }
+    const dossier = imported.get(dossierRef);
+    const pointText = excelText(row[iPoint]);
+    const refMatch = pointText.match(/\[\s*([A-Z]+-\d+)\s*\]/i);
+    const cpRef = refMatch ? refMatch[1].toUpperCase() : '';
+    if (!cpRef || !dossier.controls[cpRef]) return;
+    const rawStatus = excelText(row[iStatus]);
+    const status = VALID_STATUSES.includes(rawStatus) ? rawStatus : (rawStatus ? '' : 'N/A');
+    dossier.controls[cpRef] = {
+      status,
+      obs: excelText(row[iObs]),
+      priority: '',
+      updatedAt: null,
+      tags: []
+    };
+    importedControls++;
+  });
+
+  if (!imported.size) throw new Error('Aucun dossier identifiable dans la feuille Excel.');
+  dossiers = Array.from(imported.values());
+  dossierSeq = dossiers.length;
+  const firstDetail = detailRows.find(row => excelText(row[iDossier]));
+  if (firstDetail) {
+    if (iRefFiche >= 0) document.getElementById('ctrl-ref').value = excelText(firstDetail[iRefFiche]);
+    if (iDate >= 0) document.getElementById('ctrl-date').value = excelDate(firstDetail[iDate]);
+  }
+  const firstSummary = summaryRows.length > 1 ? summaryRows[1] : null;
+  if (firstSummary) {
+    const summaryHeaders = summaryRows[0].map(excelText);
+    const iController = excelHeaderIndex(summaryHeaders, ['Contrôleur', 'Controleur']);
+    if (iController >= 0) document.getElementById('ctrl-name').value = excelText(firstSummary[iController]);
+  }
+  addAudit('mission_imported', `${dossiers.length} dossier(s) et ${importedControls} contrôle(s) importés depuis ${fileName}`);
+  renderDossiers();
+  updateGlobalStats();
+  saveToLocalStorage();
+  showToast(`Import Excel réussi : ${dossiers.length} dossier(s), ${importedControls} contrôle(s)`, 'success');
 }
 
 function importCSV(text) {
